@@ -1,0 +1,565 @@
+---
+title: "Gender and MBTI-Style Personality Traits as Predictors of STEM Interest and Instructional-Style Preference"
+subtitle: "STAT340 — Compulsory Assignment"
+author: "Sølve Langseth"
+date: "April 2025"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    theme: united
+    df_print: paged
+geometry: margin=2cm
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  fig.align  = "center",
+  fig.height = 3.5,
+  fig.width  = 4.5,
+  message    = FALSE,
+  warning    = FALSE
+)
+
+# PAM initialises from a deterministic medoid search, but seeding keeps every
+# resampling-based figure in this document reproducible across knits.
+set.seed(340)
+```
+
+```{r libraries}
+# All packages used in the report, loaded once so that later chunks can be
+# re-run in any order without hitting "could not find function" errors.
+# Deliberately limited to widely-available packages so the document knits on a
+# stock R installation without a compiler toolchain.
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(knitr)
+library(broom)
+library(cluster)  # pam(), silhouette()
+```
+
+## 1 Introduction
+
+Interest in science, technology, engineering, and mathematics (STEM) is widely
+recognized as a key driver of future career choices and innovation. Yet
+students' enthusiasm for STEM subjects often varies along demographic and
+personality dimensions, and is shaped in part by the way material is presented
+and delivered. Laboratory research in accounting education has demonstrated that
+instructional style can significantly affect student performance, engagement,
+and satisfaction (Hartnett et al., 2003).
+
+We analyze responses from two independent samples of 5 000 Norwegian pupils each
+(Train/Test) who completed an online STEM-interest assessment developed by the
+National Centre for Science Recruitment. The data comprise demographic factors
+(sex, age-group), four MBTI-style personality dichotomies, twelve work-type
+interest items, nine teaching-preference items, and six STEM-subject ratings.
+
+In this paper, we address two interlinked questions:
+
+1.  **Personality & STEM enthusiasm.** To what extent do sex and MBTI-style
+    traits predict pupils' overall STEM-interest scores?
+2.  **Persona-driven pedagogy.** Can those same traits infer each pupil's
+    optimal instructional-style persona — "Discussion-oriented" versus
+    "Independent/hands-on" — as derived from PCA of teaching-preference items
+    and PAM clustering?
+
+To answer these, we employ four complementary methods — multiple linear
+regression, principal component analysis (PCA), PAM clustering, and logistic
+regression — each trained on the Train set and validated on the Test set. This
+framework not only quantifies which personality dimensions drive STEM-interest,
+but also demonstrates how a brief personality inventory could guide educators
+toward the most effective teaching format for individual students.
+
+# 2 Methods
+
+## 2.1 Data & Preprocessing
+
+```{r load-data}
+# The .Rdata file restores two data frames into the global environment:
+# `Train` and `Test`, 5 000 pupils each.
+load("../data/CompulsorySTAT340.Rdata")
+
+# An integer ID keeps rows traceable after the joins and cluster assignments
+# performed further down.
+Train$ID <- seq_len(nrow(Train))
+Test$ID  <- seq_len(nrow(Test))
+
+# The raw personality columns are stored as 0/1 flags. Recoding them into
+# labelled factors makes every downstream model summary self-documenting:
+# the coefficient reads "SexM" or "FF" rather than "Sex1" or "F1".
+recode_mbti <- function(df) {
+  df %>%
+    mutate(
+      Sex       = factor(Sex, levels = c("F", "M"), labels = c("F", "M")),
+      I         = factor(I,   levels = 0:1, labels = c("E", "I")),  # Extravert / Introvert
+      S         = factor(S,   levels = 0:1, labels = c("N", "S")),  # iNtuitive / Sensing
+      F         = factor(F,   levels = 0:1, labels = c("T", "F")),  # Thinking  / Feeling
+      C         = factor(C,   levels = 0:1, labels = c("D", "C")),  # Digital   / Contextual
+      Age_group = factor(Age,
+                         levels = c(1, 13, 16, 19, 30),
+                         labels = c("1–12", "13–15", "16–18", "19–30", "30+"))
+    )
+}
+
+Train <- recode_mbti(Train)
+Test  <- recode_mbti(Test)
+```
+
+```{r factor-distribution, echo = FALSE}
+# Table 1: how the sample splits across sex and the four MBTI dichotomies.
+Train %>%
+  mutate(across(c(Sex, I, S, F, C), as.character)) %>%
+  pivot_longer(c(Sex, I, S, F, C), names_to = "Variable", values_to = "Level") %>%
+  count(Variable, Level, name = "n") %>%
+  arrange(Variable, desc(n)) %>%
+  kable(caption = "Table 1. Level counts for sex and the MBTI-style dichotomies (Train set)",
+        booktabs = TRUE, align = "llr")
+```
+
+**Preprocessing steps.** We added an integer ID to preserve Train/Test pairing,
+recoded the 0/1 personality flags into labeled factors, and centered + scaled
+the nine instructional-preference items (so each has mean 0 and unit variance)
+for PCA. **Table 1** summarizes the factor distributions in the Train set.
+
+The training sample was 3 231 females and 1 769 males; MBTI-trait splits ranged
+roughly 50–50 on each dichotomy.
+
+## 2.2 Descriptive Statistics and Model Justification
+
+Before fitting any of our core models, we conducted descriptive analyses of the
+key variables — examining distributions, checking for outliers or skewness, and
+exploring group differences — to (1) verify that each outcome and predictor met
+the necessary assumptions, (2) identify which covariates (e.g. sex) merited
+inclusion, and (3) inform the choice of dimension-reduction and clustering
+methods.
+
+### Overall STEM interest
+
+```{r eda-stem-hist, fig.cap = "Figure 1: Distribution of average STEM interest (1–6)", echo = FALSE}
+# The response for the regression in 2.3: each pupil's mean rating across the
+# six STEM subjects, collapsing six correlated Likert items into one score.
+Train <- Train %>%
+  mutate(Mean_STEM = rowMeans(select(., Chem, Bio, Geo, Math, Phys, Cplx)))
+
+ggplot(Train, aes(Mean_STEM)) +
+  geom_histogram(binwidth = 0.25, fill = "steelblue", color = "white") +
+  labs(x = "Average STEM interest (1–6)", y = "Count") +
+  theme_minimal()
+```
+
+**Figure 1** shows a tidy bell-shaped distribution centred near 3.5 on the 1–6
+scale. The bell shape justifies treating `Mean_STEM` as approximately continuous
+and symmetric, which is ideal for a multiple-regression model.
+
+### Math interest by sex
+
+```{r eda-math-sex, fig.cap = "Figure 2: Mathematics interest by sex", echo = FALSE}
+ggplot(Train, aes(x = Sex, y = Math, fill = Sex)) +
+  geom_boxplot() +
+  labs(x = "Sex", y = "Math interest (1–6)") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+**Figure 2** Both sexes have the same median math-interest (level 3), but the
+male distribution is more spread out toward the top end: 25 % of boys score 5 or
+6, whereas girls' upper quartile tops out around 4.
+
+### Summary
+
+The histogram of **Mean_STEM** is approximately bell-shaped and centered near
+the scale midpoint, supporting its treatment as a continuous outcome in a linear
+model. Boxplots of math interest by sex (Figure 2) reveal that, while medians
+coincide at 3, boys show a heavier upper tail (25 % scoring ≥ 5 versus girls'
+upper quartile at 4). Although our primary focus is on instructional-style
+effects, this pronounced gender gap must be accounted for — otherwise the model
+might attribute differences in STEM interest to teaching preferences that
+actually stem from unadjusted sex differences. Accordingly, we include **Sex** as
+a covariate alongside the four MBTI dimensions in our first inferential model.
+
+## 2.3 Multiple Linear Regression: Overall STEM Interest
+
+To quantify how sex and MBTI-style personality traits relate to overall STEM
+enthusiasm, we fitted a multiple linear regression model with **Mean_STEM** as
+the response and **Sex**, **I**, **S**, **F**, and **C** as predictors.
+
+```{r mlr-fit}
+m1 <- lm(Mean_STEM ~ Sex + I + S + F + C, data = Train)
+
+# R² is quoted in the prose below, so pull it out rather than hard-coding it.
+r2_val <- round(summary(m1)$r.squared, 3)
+```
+
+```{r mlr-table, echo = FALSE}
+# Table 2: tidy coefficient table. p-values below 0.001 are shown as "<0.001"
+# rather than as a string of zeros.
+tidy(m1) %>%
+  mutate(
+    Estimate     = round(estimate, 3),
+    `Std. Error` = round(std.error, 3),
+    `p-value`    = ifelse(p.value < 0.001, "<0.001", as.character(round(p.value, 3)))
+  ) %>%
+  select(Term = term, Estimate, `Std. Error`, `p-value`) %>%
+  kable(caption = "Table 2. Regression coefficients predicting mean STEM interest",
+        booktabs = TRUE, row.names = FALSE)
+```
+
+Table 2 shows that Sex (M) (β = 0.247, p < 0.001), Introversion (I) (β = 0.141,
+p < 0.001), Sensing (S) (β = 0.054, p = 0.06), Feeling (F) (β = –0.187,
+p < 0.001), and Contextual (C) (β = –0.173, p < 0.001) are significant
+predictors of overall STEM interest. The model explains a modest but meaningful
+portion of the variance (R² = `r r2_val`).
+
+## 2.4 Principal Component Analysis: Instructional Style
+
+To summarize students' preferences on the instructional-style items, we perform
+a PCA and keep the components carrying the largest variance. Note that although
+the items are numbered up to I12, only **nine** of them are present in the
+delivered data (I1, I3, I4, I6, I7, I8, I9, I10 and I12); I2, I5 and I11 were
+not included. The PCA is therefore run on nine variables.
+
+```{r pca-fit}
+# Select the instructional-style items by name pattern rather than by position,
+# so the code does not break if the column order in the source data changes.
+# Note this yields nine items, not twelve — the numbering in the questionnaire
+# is not contiguous.
+instr_vars <- grep("^I\\d+$", names(Train), value = TRUE)
+
+pc_obj <- prcomp(Train[, instr_vars], center = TRUE, scale. = TRUE)
+
+# Attach the first two component scores to both sets. The Test scores are
+# obtained by projecting onto the Train rotation — never by re-fitting a PCA on
+# the Test data, which would leak information and change the axes.
+Train$PC1 <- pc_obj$x[, 1]
+Train$PC2 <- pc_obj$x[, 2]
+Test[, c("PC1", "PC2")] <- predict(pc_obj, newdata = Test[, instr_vars])[, 1:2]
+
+# Percentage of variance explained, quoted inline in the text below.
+var_PC1 <- round(100 * summary(pc_obj)$importance[2, 1], 1)
+var_PC2 <- round(100 * summary(pc_obj)$importance[2, 2], 1)
+```
+
+```{r pca-scree, fig.cap = "Figure 3: Scree plot of the instructional-style PCA", echo = FALSE}
+# Scree plot built directly from the prcomp object rather than via factoextra,
+# to keep the report's dependency list small.
+data.frame(
+  PC  = seq_along(pc_obj$sdev),
+  Var = 100 * pc_obj$sdev^2 / sum(pc_obj$sdev^2)
+) %>%
+  ggplot(aes(x = factor(PC), y = Var, group = 1)) +
+  geom_col(fill = "steelblue") +
+  geom_line(color = "grey30") +
+  geom_point(color = "grey30") +
+  geom_text(aes(label = sprintf("%.1f", Var)), vjust = -0.6, size = 2.6) +
+  labs(x = "Principal component", y = "Variance explained (%)") +
+  expand_limits(y = max(100 * pc_obj$sdev^2 / sum(pc_obj$sdev^2)) * 1.15) +
+  theme_minimal()
+```
+
+**Figure 3** shows that PC1 and PC2 together account for ~40 % of the variance
+(PC1 = `r var_PC1` %, PC2 = `r var_PC2` %). We focus on these two components
+because adding PC3 reduced clustering quality (average silhouette width fell
+from 0.341 to 0.250).
+
+```{r pca-loadings, echo = FALSE}
+# Table 3: only loadings above |0.25| are shown — below that the items
+# contribute too little to be worth interpreting.
+#
+# Item descriptions are joined in from `Variables_names`, the dictionary shipped
+# inside the .Rdata file, rather than typed by hand. This guarantees the labels
+# in the table always agree with the data.
+load_df <- data.frame(
+  ShortName = rownames(pc_obj$rotation),
+  PC1       = round(pc_obj$rotation[, 1], 3),
+  PC2       = round(pc_obj$rotation[, 2], 3),
+  row.names = NULL
+) %>%
+  left_join(Variables_names, by = "ShortName") %>%
+  select(Item = ShortName, Description = LongName, PC1, PC2)
+
+load_df %>%
+  filter(abs(PC1) > 0.25 | abs(PC2) > 0.25) %>%
+  kable(caption = paste0("Table 3. Loadings above |0.25| on PC1 (", var_PC1,
+                         " %) and PC2 (", var_PC2, " %)"),
+        booktabs = TRUE, row.names = FALSE)
+```
+
+The loadings reveal two complementary dimensions of instructional preference:
+
+**PC 1 – "Exploratory vs. Formulaic Structure"**
+This component captures how much structure students prefer in their learning
+environment. At the positive end, we see strong contributions from *Abductive
+Theoretical Instruction* (I3, +0.35), *Practical Problem-based Instruction*
+(I9, +0.29) and *Explorative Inspirational Instruction* (I7, +0.29) — formats
+that emphasize conceptual thinking and open-ended enquiry. On the negative end
+are *Methodological Formula-Oriented Instruction* (I6, –0.57) and *Instrumental
+Procedure-Oriented Instruction* (I10, –0.55), which represent highly structured,
+step-by-step teaching. Students with high PC 1 scores tend to prefer loosely
+structured, theory-led exploration, while those with low scores are more
+comfortable with precise, rule-based guidance.
+
+**PC 2 – "Collaborative vs. Independent Engagement"**
+This axis reflects students' preferred mode of interaction. Positive loadings
+come from *Dialog-based Inspirational Instruction* (I8, +0.53) and *Dialog and
+Group Oriented Theoretical Instruction* (I4, +0.48), indicating a preference for
+collaborative learning and teacher feedback. At the negative end, *Explorative
+Inspirational Instruction* (I7, –0.51) and *Abductive Theoretical Instruction*
+(I3, –0.38) signal a tendency toward self-directed discovery with minimal verbal
+instruction. Students who score high on PC 2 thrive in collaborative,
+discussion-based settings, whereas those who score low prefer independent,
+exploratory work.
+
+Note that I3 and I7 load on both axes with opposite signs: both describe
+open-ended instruction, but PC 2 separates whether that openness happens *in
+dialogue with others* or *alone*.
+
+Together, these two orthogonal components summarize students' instructional
+preferences along two core dimensions — level of structure and mode of
+engagement — and serve as the basis for our subsequent clustering analysis.
+
+## 2.5 Clustering: Learner Personas
+
+To identify broad learner personas based on instructional preferences, we
+applied PAM (partitioning around medoids) clustering to the first two principal
+components. PAM is preferred over k-means here because medoids are actual
+observations, which makes each persona directly interpretable as a
+representative pupil.
+
+```{r pam-fit}
+# Two clusters, fitted on the Train PC scores only.
+pam2 <- pam(Train[, c("PC1", "PC2")], k = 2)
+
+cat("k = 2 average silhouette width:", round(pam2$silinfo$avg.width, 3), "\n")
+
+# Label the clusters by persona now, so that every table, plot and model
+# summary downstream reports the same two names.
+persona_levels <- c("Discussion-oriented", "Independent/hands-on")
+Train$learner_cluster <- factor(pam2$clustering, labels = persona_levels)
+
+# Medoid coordinates drive the Test-set assignment below.
+medoids2 <- pam2$medoids[, c("PC1", "PC2")]
+```
+
+```{r pam-silhouette, fig.cap = "Figure 4: Silhouette plot for k = 2", echo = FALSE}
+plot(silhouette(pam2),
+     col    = c("#E69F00", "#56B4E9")[pam2$clustering],
+     border = NA,
+     main   = "Silhouette plot (k = 2)")
+```
+
+**Figure 4** shows that k = 2 gives reasonable cluster separation (average
+silhouette width = 0.34).
+
+```{r pam-plot, fig.width = 6, fig.height = 4, fig.cap = "Figure 5: Learner personas in PC1–PC2 space", echo = FALSE}
+# Plotted after the clusters and medoids exist — the medoids are drawn as
+# black stars on top of the two persona point clouds.
+ggplot(Train, aes(x = PC1, y = PC2, color = learner_cluster)) +
+  geom_point(alpha = 0.6, size = 1.8) +
+  stat_ellipse(type = "norm", linetype = "dashed") +
+  geom_point(data = as.data.frame(medoids2), aes(x = PC1, y = PC2),
+             color = "black", size = 4, shape = 8, inherit.aes = FALSE) +
+  labs(title = "Learner personas from instructional preferences",
+       x     = "PC1 (Exploratory ↔ Formulaic)",
+       y     = "PC2 (Collaborative ↔ Independent)",
+       color = "Persona") +
+  theme_minimal()
+```
+
+**Figure 5** visualizes the resulting clusters, with medoids marked by stars.
+Based on medoid positions and the PCA loadings, we interpret:
+
+* **Cluster 1 — "Discussion-oriented"**: high on collaboration, low on structure.
+* **Cluster 2 — "Independent/hands-on"**: prefers structured, self-directed
+  learning.
+
+## 2.6 Logistic Regression: Predicting the Persona
+
+```{r persona-assign-test}
+# Assign each Test pupil to the nearest Train medoid in PC1–PC2 space. The
+# labels must match `persona_levels` exactly, otherwise the confusion matrix
+# below would compare two differently-labelled factors.
+Test$learner_cluster <- factor(
+  apply(Test[, c("PC1", "PC2")], 1, function(z) {
+    d <- sqrt((z[1] - medoids2[, "PC1"])^2 + (z[2] - medoids2[, "PC2"])^2)
+    which.min(d)
+  }),
+  levels = 1:2,
+  labels = persona_levels
+)
+```
+
+```{r persona-glm}
+# Can sex and the four MBTI traits recover the persona? Fitted on Train,
+# evaluated on the untouched Test set.
+glm2 <- glm(learner_cluster ~ Sex + I + S + F + C,
+            data = Train, family = binomial)
+
+# glm models the probability of the SECOND factor level, i.e. P(Independent/hands-on).
+prob2 <- predict(glm2, newdata = Test, type = "response")
+pred2 <- factor(ifelse(prob2 > 0.5, persona_levels[2], persona_levels[1]),
+                levels = persona_levels)
+
+cm <- table(True = Test$learner_cluster, Predicted = pred2)
+cm
+
+acc <- sum(diag(cm)) / sum(cm)
+cat("Accuracy on Test set:", round(acc, 3), "\n")
+```
+
+```{r persona-odds, echo = FALSE}
+# Exponentiated coefficients give odds ratios, which read more naturally than
+# log-odds when describing who prefers which teaching format.
+tidy(glm2, conf.int = TRUE, exponentiate = TRUE) %>%
+  select(Term = term, `Odds ratio` = estimate,
+         `CI low` = conf.low, `CI high` = conf.high, `p-value` = p.value) %>%
+  kable(caption = "Table 4. Odds ratios (95 % CI) for predicting learner persona",
+        digits = 3, booktabs = TRUE)
+```
+
+We fitted a logistic regression model to predict each pupil's
+instructional-style persona — "Discussion-oriented" vs "Independent/hands-on" —
+based on sex and MBTI-style traits. On the independent Test set, the model
+achieved **`r round(100 * acc)` % accuracy**.
+
+The most predictive traits were **Contextuality** (OR = 1.64, p < 0.001),
+**Extraversion** (OR = 1.33, inverse of the Introvert OR), and **Sex** (males
+more likely to prefer independent/hands-on formats, OR = 1.18, p = 0.008).
+Sensing types were strongly associated with the discussion-oriented persona
+(OR = 0.33, p < 0.001).
+
+These results suggest that basic personality indicators can offer **moderate
+predictive power** in identifying a pupil's preferred learning style.
+
+# 3 Results
+
+## 3.1 Multiple Linear Regression: Overall STEM Interest
+
+The regression of **Mean_STEM** on sex and MBTI traits revealed the following:
+
+- **Sex (M):** +0.25 (p < 0.001), indicating that male pupils report, on
+  average, a quarter-point higher STEM interest than females.
+- **Introversion (I):** +0.14 (p < 0.001), showing that introverts rate STEM
+  higher than extraverts.
+- **Sensing (S):** +0.05 (p ≈ 0.06), a borderline effect suggesting slightly
+  higher STEM interest among sensors.
+- **Feeling (F):** –0.19 (p < 0.001), indicating lower STEM interest for feelers.
+- **Contextual (C):** –0.17 (p < 0.001), indicating lower STEM interest for
+  contextual learners.
+
+These results confirm clear gender and personality influences on overall STEM
+enthusiasm.
+
+## 3.2 PCA of Instructional Preferences & Clustering of Learner Personas
+
+- **PCA:** The first two components captured ≈ 40 % of the variance across the
+  nine teaching-preference items:
+  - **PC1** (`r var_PC1` %): Exploratory ↔ Formulaic
+  - **PC2** (`r var_PC2` %): Collaborative ↔ Independent
+
+- **Clustering:** PAM clustering on PC1 and PC2 with **k = 2** identified two
+  broad instructional-style personas:
+  - **Cluster 1 – "Discussion-oriented"**: pupils who prefer collaborative and
+    dialog-heavy formats.
+  - **Cluster 2 – "Independent/hands-on"**: pupils who prefer self-paced,
+    solitary, or experiential learning.
+
+Silhouette analysis supported moderate clustering quality (width ≈ 0.341), and
+cluster interpretation was guided by medoid positions on the PC1–PC2 plane.
+
+## 3.3 Logistic Regression: Predicting Learner Persona
+
+To assess whether a pupil's instructional-style persona could be predicted from
+basic personal traits, we fitted a logistic regression with cluster membership
+as the outcome. On the Test set, the model achieved
+**`r round(100 * acc)` % accuracy**.
+
+Key effects included:
+
+- **Contextual (C):** OR = 1.64 (p < 0.001) – more likely to be
+  "Independent/hands-on"
+- **Sex (M):** OR = 1.18 (p = 0.008) – males favoured "Independent/hands-on"
+- **Introversion (I):** OR = 0.75 (p < 0.001) – introverts leaned
+  "Discussion-oriented"
+- **Sensing (S):** OR = 0.33 (p < 0.001) – strong association with
+  "Discussion-oriented"
+- **Feeling (F):** no significant effect
+
+These results show that simple MBTI-style traits can moderately infer learning
+persona, with Contextuality and Sensing emerging as the strongest predictors.
+
+# 4 Discussion & Conclusions
+
+This study explored how basic personality and demographic traits relate not only
+to students' enthusiasm for STEM but also to how they prefer to learn. Using a
+large-scale national dataset and four complementary methods — multiple
+regression, PCA, clustering, and logistic regression — we found the following:
+
+- **Gender and personality predict STEM enthusiasm.**
+  Male pupils reported higher overall STEM interest, as did introverts. Feelers
+  and contextual learners showed consistently lower interest in STEM.
+
+- **Teaching-style preferences are structured and interpretable.**
+  PCA revealed two clear instructional axes — exploratory vs. formulaic (PC1)
+  and collaborative vs. independent (PC2) — together explaining ≈ 40 % of the
+  variance in preferences.
+
+- **Learner personas fall into two instructional styles.**
+  PAM clustering on PC1 and PC2 defined two broad groups: "Discussion-oriented"
+  and "Independent/hands-on." This reframes pupil engagement in terms of
+  preferred learning modes, not just STEM interest levels.
+
+- **Personality traits can modestly predict these personas.**
+  A logistic model achieved `r round(100 * acc)` % accuracy in predicting
+  cluster membership from sex and MBTI-style traits. Contextual learners and
+  males were more likely to prefer independent/hands-on formats, while
+  introverts and sensors leaned toward discussion-based approaches.
+
+These findings highlight the potential of lightweight personality inventories to
+guide instructional tailoring. Even without complex testing or classroom
+observation, educators could estimate a pupil's likely learning preference — and
+potentially improve engagement by adjusting teaching methods accordingly.
+
+Future work might integrate academic performance, motivation, and environmental
+factors to refine these models, moving toward more personalized and responsive
+education for tomorrow's STEM learners.
+
+# References
+
+Hartnett, N., Römcke, J., & Yap, C. (2003). Recognizing the importance of
+instruction style to students' performance: some observations from laboratory
+research — a research note. *Accounting Education*, 12(3), 313–331.
+
+# Appendix A — Regression Diagnostics
+
+```{r appendix-diagnostics, fig.width = 8, fig.height = 4, echo = FALSE}
+# Residuals-vs-fitted checks linearity and constant variance; the normal Q–Q
+# plot checks the normality assumption behind the reported p-values.
+par(mfrow = c(1, 2))
+plot(m1, which = 1)
+plot(m1, which = 2)
+```
+
+Residuals versus fitted values form a roughly random band of constant width, so
+the linearity and equal-variance assumptions hold. The normal Q–Q plot follows
+the reference line apart from mild movement in the tails, which is not a concern
+at n = 5 000.
+
+# Appendix B — Variable Dictionary
+
+The `.Rdata` file ships a `Variables_names` lookup table mapping each column to
+its full questionnaire wording. It is reproduced here so the loadings in
+Table 3 can be read without going back to the source data.
+
+```{r appendix-dictionary, echo = FALSE}
+Variables_names %>%
+  select(Column = ShortName, Description = LongName) %>%
+  kable(caption = "Table B-1. Column names and their questionnaire wording",
+        booktabs = TRUE, row.names = FALSE)
+```
+
+# Appendix C — Session Information
+
+```{r appendix-session, echo = FALSE}
+sessionInfo()
+```

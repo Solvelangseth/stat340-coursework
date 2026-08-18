@@ -1,0 +1,22 @@
+# --- RStudio session state (machine-specific, never useful in version control) ---
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+
+# --- Knitted intermediates ---
+# The final report/stat340-report.html IS committed on purpose: it is the
+# submitted artefact. Only the intermediate build directories are ignored.
+*_files/
+*_cache/
+
+# --- macOS ---
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# --- Editors ---
+.vscode/
+.idea/
+*~
+*.swp
